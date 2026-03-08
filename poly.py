@@ -6,7 +6,7 @@ import requests
 from functools import lru_cache
 
 BASE = "https://gamma-api.polymarket.com"
-VERSION = "0.8"
+VERSION = "0.9"
 
 # Initialize curses colors
 def init_colors():
@@ -49,7 +49,7 @@ class Cache:
 cache = Cache(ttl=60)
 
 
-def fetch_events(limit=200, tag_id=None, tag_slug=None, volume_min=None, liquidity_min=None):
+def fetch_events(limit=1000, tag_id=None, tag_slug=None, volume_min=None, liquidity_min=None):
     cache_key = f"events_{tag_id or tag_slug or 'all'}_{limit}_{volume_min}_{liquidity_min}"
     cached = cache.get(cache_key)
     if cached:
@@ -241,10 +241,11 @@ def main(stdscr):
     # Charge tous les events (filtrés pour les plus significatifs)
     events = []
     error_message = None
+    show_descriptions = False  # Start with descriptions hidden
     
     try:
         events = fetch_events(
-            limit=100,
+            limit=1000,  # Increased from 100 to 1000
             volume_min=1000000,  # 1M minimum volume
             liquidity_min=10000  # 10k minimum liquidity
         )
@@ -267,7 +268,7 @@ def main(stdscr):
         if now - last_refresh > REFRESH_INTERVAL:
             try:
                 events = fetch_events(
-                    limit=100,
+                    limit=1000,  # Increased from 100 to 1000
                     volume_min=1000000,
                     liquidity_min=10000
                 )
@@ -306,7 +307,8 @@ def main(stdscr):
             continue
 
         # Colonne events (gauche) - avec couleurs et ASCII art et scrolling
-        stdscr.addstr(0, 0, "📊 Events (Title + Description) 📊", curses.color_pair(4) | curses.A_BOLD)
+        desc_indicator = "📝 ON" if show_descriptions else "📝 OFF"
+        stdscr.addstr(0, 0, f"📊 Events (Title {desc_indicator}) 📊", curses.color_pair(4) | curses.A_BOLD)
         
         # Draw a separator line
         separator = "─" * min(col_events, w - 1)
@@ -388,8 +390,8 @@ def main(stdscr):
                     stdscr.addstr(y, 0, indent + title_line, title_color)
                 y += 1
             
-            # Display description if there's space
-            if description and y < h - 1:
+            # Display description only if show_descriptions is True
+            if show_descriptions and description and y < h - 1:
                 desc_lines = wrap_text("✎ " + description, col_events - 3)
                 for desc_line in desc_lines:
                     if y >= h - 1:
@@ -477,7 +479,7 @@ def main(stdscr):
                 stdscr.addstr(y, col_events, line, color)
 
         # Barre du bas - avec couleurs et ASCII art
-        help_text = " 🔼/🔽 Events  ◀/▶ Markets  🔘 V-filter  🔄 Refresh  🚪 Quit "
+        help_text = " 🔼/🔽 Events  ◀/▶ Markets  🔘 V-filter  📝 Desc  🔄 Refresh  🚪 Quit "
         ts = datetime.fromtimestamp(last_refresh).strftime("%H:%M:%S")
         ts_text = f" ⏱️  {ts} "
 
@@ -601,6 +603,9 @@ def main(stdscr):
                 last_refresh = time.time()
         elif ch == ord("v"):
             volume_filter_enabled = not volume_filter_enabled
+        elif ch == ord("d"):
+            # Toggle description display
+            show_descriptions = not show_descriptions
 
 
 def text_mode_main():
@@ -611,7 +616,7 @@ def text_mode_main():
     
     try:
         events = fetch_events(
-            limit=10,
+            limit=1000,  # Increased from 10 to 1000
             volume_min=1000000,
             liquidity_min=10000
         )

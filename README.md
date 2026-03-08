@@ -3,7 +3,7 @@
 ```
           Poly-client
   Polymarket CLI Client - Terminal Interface
-            v0.8
+            v0.9
 ```
 
 ## Features
@@ -38,6 +38,7 @@ python3 poly.py
 - **←/→**: Navigate markets within selected event
 - **r**: Refresh all events
 - **v**: Toggle volume filter (1000 USDC minimum)
+- **d**: Toggle event descriptions (show/hide)
 - **q**: Quit application
 
 ### Text Mode
@@ -47,5 +48,6 @@ If terminal doesn't support curses, automatically falls back to text mode showin
 
 - **API Endpoint**: `https://gamma-api.polymarket.com`
 - **Cache TTL**: 60 seconds
-- **Default Limits**: 100 events, significant events only
+- **Default Limits**: 1000 events, significant events only
 - **Market Sorting**: By `outcomePrices[0]` (YES outcome) descending
+- **Description Toggle**: Press 'd' to show/hide event descriptions
