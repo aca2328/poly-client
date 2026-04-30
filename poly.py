@@ -1,60 +1,78 @@
 import curses
 import json
+import os
 import time
 from datetime import datetime
-import requests
 from functools import lru_cache
+
+import requests
 
 BASE = "https://gamma-api.polymarket.com"
 VERSION = "0.9"
+DEFAULT_EVENT_LIMIT = 1000
+DEFAULT_VOLUME_MIN = 1_000_000
+DEFAULT_LIQUIDITY_MIN = 10_000
+REFRESH_INTERVAL = 10
+REQUEST_TIMEOUT = 10
 
-# Initialize curses colors
+session = requests.Session()
+
+
 def init_colors():
     """Initialize color pairs for better visibility."""
     curses.start_color()
     curses.use_default_colors()
-    
-    # Define color pairs
-    curses.init_pair(1, curses.COLOR_RED, -1)      # Error messages
-    curses.init_pair(2, curses.COLOR_GREEN, -1)    # Success/positive
-    curses.init_pair(3, curses.COLOR_YELLOW, -1)   # Highlights/warnings
-    curses.init_pair(4, curses.COLOR_BLUE, -1)     # Headers
-    curses.init_pair(5, curses.COLOR_CYAN, -1)     # Selected items
-    curses.init_pair(6, curses.COLOR_MAGENTA, -1)  # Descriptions
-    curses.init_pair(7, curses.COLOR_WHITE, -1)    # Bright text
+
+    curses.init_pair(1, curses.COLOR_RED, -1)
+    curses.init_pair(2, curses.COLOR_GREEN, -1)
+    curses.init_pair(3, curses.COLOR_YELLOW, -1)
+    curses.init_pair(4, curses.COLOR_BLUE, -1)
+    curses.init_pair(5, curses.COLOR_CYAN, -1)
+    curses.init_pair(6, curses.COLOR_MAGENTA, -1)
+    curses.init_pair(7, curses.COLOR_WHITE, -1)
+
 
 class APIError(Exception):
     pass
+
 
 class Cache:
     def __init__(self, ttl=300):
         self.ttl = ttl
         self._cache = {}
-    
+
     def get(self, key):
         item = self._cache.get(key)
-        if item and time.time() - item['timestamp'] < self.ttl:
-            return item['data']
+        if item is not None and time.time() - item["timestamp"] < self.ttl:
+            return item["data"]
         return None
-    
+
     def set(self, key, data):
-        self._cache[key] = {'data': data, 'timestamp': time.time()}
-    
+        self._cache[key] = {"data": data, "timestamp": time.time()}
+
     def clear(self, key=None):
         if key:
             self._cache.pop(key, None)
         else:
             self._cache.clear()
 
+
 cache = Cache(ttl=60)
 
 
-def fetch_events(limit=1000, tag_id=None, tag_slug=None, volume_min=None, liquidity_min=None):
+def fetch_events(
+    limit=DEFAULT_EVENT_LIMIT,
+    tag_id=None,
+    tag_slug=None,
+    volume_min=None,
+    liquidity_min=None,
+    force_refresh=False,
+):
     cache_key = f"events_{tag_id or tag_slug or 'all'}_{limit}_{volume_min}_{liquidity_min}"
     cached = cache.get(cache_key)
-    if cached:
+    if not force_refresh and cached is not None:
         return cached
-    
+
     try:
         params = {
             "order": "volume",
@@ -71,41 +89,33 @@ def fetch_events(limit=1000, tag_id=None, tag_slug=None, volume_min=None, liquid
             params["volumeMin"] = volume_min
         if liquidity_min:
             params["liquidityMin"] = liquidity_min
-        r = requests.get(f"{BASE}/events", params=params, timeout=10)
-        r.raise_for_status()
-        data = r.json()
+
+        response = session.get(f"{BASE}/events", params=params, timeout=REQUEST_TIMEOUT)
+        response.raise_for_status()
+        data = response.json()
         cache.set(cache_key, data)
         return data
     except requests.exceptions.RequestException as e:
-        raise APIError(f"Failed to fetch events: {str(e)}")
+        raise APIError(f"Failed to fetch events: {e}") from e
 
 
-def fetch_tags(limit=50):
-    # Gamma /tags: liste de tous les tags. [web:42][web:104][web:130]
+def fetch_tags(limit=50, force_refresh=False):
     cache_key = f"tags_{limit}"
     cached = cache.get(cache_key)
-    if cached:
+    if not force_refresh and cached is not None:
         return cached
-    
-    try:
-        r = requests.get(f"{BASE}/tags", timeout=10)
-        r.raise_for_status()
-        tags = r.json()
 
-        # tags est typiquement une liste de dicts: {id, label, slug, market_count, ...}
-        # On essaie de les trier par "market_count" desc si dispo, sinon par id.
-        def sort_key(t):
-            if isinstance(t, dict):
-                if "market_count" in t:
-                    try:
-                        return float(t["market_count"])
-                    except Exception:
-                        return 0.0
-                if "rank" in t:
-                    try:
-                        return float(t["rank"])
-                    except Exception:
-                        return 0.0
+    try:
+        response = session.get(f"{BASE}/tags", timeout=REQUEST_TIMEOUT)
+        response.raise_for_status()
+        tags = response.json()
+
+        def sort_key(tag):
+            if isinstance(tag, dict):
+                if "market_count" in tag:
+                    return _coerce_float(tag["market_count"], 0.0)
+                if "rank" in tag:
+                    return _coerce_float(tag["rank"], 0.0)
             return 0.0
 
         tags.sort(key=sort_key, reverse=True)
@@ -113,499 +123,557 @@ def fetch_tags(limit=50):
         cache.set(cache_key, result)
         return result
     except requests.exceptions.RequestException as e:
-        raise APIError(f"Failed to fetch tags: {str(e)}")
+        raise APIError(f"Failed to fetch tags: {e}") from e
 
 
-def _get_volume24(m):
+def _coerce_float(value, default=0.0):
+    if value in (None, ""):
+        return default
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def _parse_outcome_prices(value):
+    if isinstance(value, str):
+        try:
+            value = json.loads(value)
+        except (TypeError, ValueError, json.JSONDecodeError):
+            return ()
+
+    if not isinstance(value, list):
+        return ()
+
+    return tuple(_coerce_float(price, None) for price in value)
+
+
+def _get_volume24(market):
     return (
-        m.get("volume24hr")
-        or m.get("volume24h")
-        or m.get("volume24Hr")
-        or m.get("volume_24hr")
+        market.get("volume24hr")
+        or market.get("volume24h")
+        or market.get("volume24Hr")
+        or market.get("volume_24hr")
         or 0
     )
 
 
-def format_tags(ev):
-    raw_tags = ev.get("tags") or ev.get("categories") or []
+def format_tags(event):
+    raw_tags = event.get("tags") or event.get("categories") or []
     tags = []
-    for t in raw_tags:
-        if isinstance(t, dict):
-            label = t.get("label") or t.get("slug")
+    for tag in raw_tags:
+        if isinstance(tag, dict):
+            label = tag.get("label") or tag.get("slug")
             if label:
                 tags.append(str(label))
         else:
-            tags.append(str(t))
+            tags.append(str(tag))
     if not tags:
         return ""
     return ", ".join(tags)[:30]
 
 
-def _format_end_date(m):
+def _format_end_date(market):
     raw = (
-        m.get("endDate")
-        or m.get("closeTime")
-        or m.get("resolutionTime")
-        or m.get("eventDate")
+        market.get("endDate")
+        or market.get("closeTime")
+        or market.get("resolutionTime")
+        or market.get("eventDate")
     )
     if not raw:
         return ""
     try:
         dt = datetime.fromisoformat(str(raw).replace("Z", "+00:00"))
         return dt.strftime("%Y-%m-%d")
-    except Exception:
+    except (TypeError, ValueError):
         return str(raw)[:10]
 
+
+def _prepare_market(market):
+    if market.get("_prepared"):
+        return market
+
+    outcome_prices = _parse_outcome_prices(market.get("outcomePrices"))
+    yes_price = _coerce_float(market.get("yesPrice"), None)
+    no_price = _coerce_float(market.get("noPrice"), None)
+
+    if yes_price is None and outcome_prices:
+        yes_price = outcome_prices[0]
+    if no_price is None and len(outcome_prices) > 1:
+        no_price = outcome_prices[1]
+
+    vol24 = _coerce_float(_get_volume24(market), 0.0)
+
+    market["_question"] = str(market.get("question", ""))
+    market["_yes_price"] = yes_price
+    market["_no_price"] = no_price
+    market["_yes_pct"] = f"{yes_price * 100:.1f}%" if yes_price is not None else "n/a"
+    market["_no_pct"] = f"{no_price * 100:.1f}%" if no_price is not None else "n/a"
+    market["_yes_sort_key"] = yes_price if yes_price is not None else -1.0
+    market["_vol24"] = vol24
+    market["_vol24_str"] = f"{vol24:.0f}"
+    market["_end_str"] = _format_end_date(market)
+    market["_prepared"] = True
+    return market
+
+
+def _prepare_event(event):
+    if event.get("_prepared"):
+        return event
+
+    event["_title"] = str(event.get("title", ""))
+    event["_description"] = str(event.get("description", ""))
+
+    markets = event.get("markets") or []
+    for market in markets:
+        _prepare_market(market)
+
+    event["_markets_sorted"] = tuple(
+        sorted(markets, key=lambda market: market["_yes_sort_key"], reverse=True)
+    )
+    event["_filtered_market_cache"] = {}
+    event["_prepared"] = True
+    return event
+
+
+def prepare_events(events):
+    return [_prepare_event(event) for event in (events or [])]
+
+
+def get_visible_markets(event, volume_filter_enabled=False, volume_threshold=0.0):
+    if not event:
+        return ()
+
+    markets = event.get("_markets_sorted", ())
+    if not volume_filter_enabled:
+        return markets
+
+    filtered_cache = event.setdefault("_filtered_market_cache", {})
+    cache_key = float(volume_threshold)
+    if cache_key not in filtered_cache:
+        filtered_cache[cache_key] = tuple(
+            market for market in markets if market.get("_vol24", 0.0) >= volume_threshold
+        )
+    return filtered_cache[cache_key]
+
+
+def load_events(force_refresh=False):
+    events = fetch_events(
+        limit=DEFAULT_EVENT_LIMIT,
+        volume_min=DEFAULT_VOLUME_MIN,
+        liquidity_min=DEFAULT_LIQUIDITY_MIN,
+        force_refresh=force_refresh,
+    )
+    return prepare_events(events)
+
+
+def clamp_index(index, size):
+    if size <= 0:
+        return 0
+    return max(0, min(index, size - 1))
+
+
+@lru_cache(maxsize=4096)
 def wrap_text(text, max_width):
     """Wrap text to fit within max_width, handling line breaks and special characters."""
-    if not text:
-        return []
-    
-    # Sanitize text for curses display - replace problematic characters
-    sanitized = text.replace('“', '"').replace('”', '"').replace('’', "'").replace('–', '-')
-    # Replace newlines with spaces for wrapping
-    sanitized = sanitized.replace('\n', ' ').replace('\r', ' ')
-    
-    words = sanitized.split(' ')
+    if not text or max_width <= 0:
+        return ()
+
+    sanitized = (
+        str(text)
+        .replace("“", '"')
+        .replace("”", '"')
+        .replace("’", "'")
+        .replace("–", "-")
+        .replace("\n", " ")
+        .replace("\r", " ")
+    )
+    words = sanitized.split()
+    if not words:
+        return ()
+
     lines = []
-    current_line = ""
-    
-    for word in words:
-        # Skip empty words
-        if not word:
-            continue
-            
-        # Check if adding this word would exceed the max width
+    current_line = words[0]
+
+    for word in words[1:]:
         if len(current_line) + len(word) + 1 <= max_width:
-            if current_line:
-                current_line += " " + word
-            else:
-                current_line = word
+            current_line += " " + word
         else:
-            # Add current line to lines and start a new line
-            if current_line:
-                lines.append(current_line)
+            lines.append(current_line)
             current_line = word
-    
-    # Add the last line if it exists
-    if current_line:
-        lines.append(current_line)
-    
-    return lines
+
+    lines.append(current_line)
+    return tuple(lines)
 
 
-def format_market_line(m, width):
-    q = m.get("question", "")[: width - 40]
+def format_market_line(market, width):
+    if width <= 0:
+        return ""
 
-    yes_price = m.get("yesPrice")
-    no_price = m.get("noPrice")
+    question_width = max(0, width - 40)
+    question = market.get("_question", "")[:question_width]
+    base = f"{question}  [Y:{market.get('_yes_pct', 'n/a')} N:{market.get('_no_pct', 'n/a')}]"
+    extra = f" V24:{market.get('_vol24_str', '0')} End:{market.get('_end_str', '')}"
+    return (base + " " + extra)[:width]
 
-    if (yes_price is None or no_price is None) and m.get("outcomePrices"):
-        try:
-            prices = json.loads(m["outcomePrices"])
-            if isinstance(prices, list) and len(prices) >= 2:
-                yes_price = float(prices[0])
-                no_price = float(prices[1])
-        except Exception:
-            pass
 
-    yes_pct = f"{yes_price*100:.1f}%" if isinstance(yes_price, (int, float)) else "n/a"
-    no_pct = f"{no_price*100:.1f}%" if isinstance(no_price, (int, float)) else "n/a"
+def draw_text(stdscr, y, x, text, attr=0):
+    if not text:
+        return
 
-    vol24 = _get_volume24(m)
+    h, w = stdscr.getmaxyx()
+    if y < 0 or y >= h or x >= w:
+        return
+    if x < 0:
+        text = text[-x:]
+        x = 0
+
+    max_chars = w - x - 1
+    if max_chars <= 0:
+        return
+
     try:
-        vol24_str = f"{float(vol24):.0f}"
-    except Exception:
-        vol24_str = str(vol24)
-
-    end_str = _format_end_date(m)
-
-    base = f"{q}  [Y:{yes_pct} N:{no_pct}]"
-    extra = f" V24:{vol24_str} End:{end_str}"
-    line = (base + " " + extra)[: width]
-    return line
+        stdscr.addnstr(y, x, text, max_chars, attr)
+    except curses.error:
+        pass
 
 
-def main(stdscr):
-    # Optimize curses for reduced flickering
-    curses.curs_set(0)
-    stdscr.nodelay(True)
-    stdscr.timeout(100)
-    
-    # Enable keypad for better input handling
-    stdscr.keypad(True)
-    
-    # Initialize colors
-    init_colors()
+def draw_screen(
+    stdscr,
+    events,
+    selected_event,
+    selected_market,
+    show_descriptions,
+    volume_filter_enabled,
+    volume_threshold,
+    last_refresh,
+    error_message,
+):
+    h, w = stdscr.getmaxyx()
+    stdscr.erase()
 
-    # Charge tous les events (filtrés pour les plus significatifs)
-    events = []
-    error_message = None
-    show_descriptions = False  # Start with descriptions hidden
-    
-    try:
-        events = fetch_events(
-            limit=1000,  # Increased from 100 to 1000
-            volume_min=1000000,  # 1M minimum volume
-            liquidity_min=10000  # 10k minimum liquidity
-        )
-    except APIError as e:
-        error_message = str(e)
+    col_events = min(max(40, w // 2), max(1, w - 1))
+    col_markets = max(1, w - col_events)
 
-    selected_event = 0
-    selected_market = 0  # Track selected market for navigation
-    scroll_offset = 0    # Track scrolling position for events
-    prev_h, prev_w = None, None  # Track previous screen dimensions
+    desc_indicator = "📝 ON" if show_descriptions else "📝 OFF"
+    draw_text(
+        stdscr,
+        0,
+        0,
+        f"📊 Events (Title {desc_indicator}) 📊",
+        curses.color_pair(4) | curses.A_BOLD,
+    )
+    draw_text(stdscr, 1, 0, "─" * col_events, curses.color_pair(4))
 
-    REFRESH_INTERVAL = 10
-    last_refresh = time.time()
-
-    volume_filter_enabled = False
-    volume_threshold = 1000.0  # volume minimal en 24h (USDC)
-
-    while True:
-        now = time.time()
-        if now - last_refresh > REFRESH_INTERVAL:
-            try:
-                events = fetch_events(
-                    limit=1000,  # Increased from 100 to 1000
-                    volume_min=1000000,
-                    liquidity_min=10000
-                )
-                selected_event = min(selected_event, max(0, len(events) - 1))
-                last_refresh = now
-                error_message = None
-            except APIError as e:
-                error_message = str(e)
-                last_refresh = now
-
-        # Optimized screen update to reduce flickering
-        h, w = stdscr.getmaxyx()
-        
-        # Only do full clear if screen dimensions changed
-        if prev_h != h or prev_w != w:
-            stdscr.clear()
-            prev_h, prev_w = h, w
-        else:
-            # For normal updates, use more efficient clearing
-            stdscr.erase()
-        
-        # Use curses.doupdate() for more efficient screen updates
-        # We'll call refresh() at the end instead of after each change
-
-        col_events = max(40, w // 2)
-        col_markets = w - col_events - 1
-
-        # Loading indicator with color and animation
-        if not events and not error_message:
-            loading_texts = ["Loading data...", "Loading data.. ", "Loading data.  ", "Loading data   "]
-            loading_text = loading_texts[int(time.time() * 2) % 4]  # Simple animation
-            stdscr.addstr(h//2, w//2 - len(loading_text)//2, loading_text, curses.color_pair(3) | curses.A_BOLD)
-            stdscr.addstr(h//2 + 1, w//2 - 8, "🔄 Please wait...", curses.color_pair(3))
-            curses.doupdate()
-            time.sleep(0.1)
-            continue
-
-        # Colonne events (gauche) - avec couleurs et ASCII art et scrolling
-        desc_indicator = "📝 ON" if show_descriptions else "📝 OFF"
-        stdscr.addstr(0, 0, f"📊 Events (Title {desc_indicator}) 📊", curses.color_pair(4) | curses.A_BOLD)
-        
-        # Draw a separator line
-        separator = "─" * min(col_events, w - 1)
-        stdscr.addstr(1, 0, separator, curses.color_pair(4))
-        
-        # Calculate visible events based on screen height
-        available_height = h - 3  # Subtract header and separator lines
-        
-        # Fixed cursor position logic: selected event stays at top of screen
-        # The selected event will always appear at the top (y=2)
-        fixed_cursor_y = 2  # Top of the events area
-        
-        # Calculate scroll offset to keep selected event at top
-        # We want selected_event to appear at the first position (index 0)
-        cursor_list_position = 0  # Selected event at top of visible list
-        
-        # Calculate the maximum scroll position that keeps selected event visible
-        max_scroll_for_selection = selected_event
-        
-        # But also ensure we don't scroll past the end of the list
+    available_height = max(0, h - 3)
+    scroll_offset = 0
+    if events and available_height:
         max_possible_scroll = max(0, len(events) - available_height)
-        
-        # Use the more restrictive of the two
-        scroll_offset = min(max_scroll_for_selection, max_possible_scroll)
-        
-        # Ensure scroll_offset is not negative
-        scroll_offset = max(0, scroll_offset)
-        
-        # Final check: if selected event would be scrolled out of view, adjust
-        if selected_event >= scroll_offset + available_height:
-            scroll_offset = selected_event - available_height + 1
-            scroll_offset = max(0, min(scroll_offset, max_possible_scroll))
-        
-        # Show scroll position indicator if there are more events than fit on screen
+        scroll_offset = min(selected_event, max_possible_scroll)
+
         if len(events) > available_height:
-            scroll_indicator = f" 📜 [{scroll_offset + 1}-{min(scroll_offset + available_height, len(events))}/{len(events)}]"
-            stdscr.addstr(1, col_events - len(scroll_indicator) - 1, scroll_indicator, curses.color_pair(4))
-        
-        # Display events with selected event always at top
+            scroll_indicator = (
+                f" 📜 [{scroll_offset + 1}-{min(scroll_offset + available_height, len(events))}/{len(events)}]"
+            )
+            draw_text(
+                stdscr,
+                1,
+                max(0, col_events - len(scroll_indicator) - 1),
+                scroll_indicator,
+                curses.color_pair(4),
+            )
+
         y = 2
-        
-        # Display visible events starting from scroll_offset
-        for i, ev in enumerate(events[scroll_offset:scroll_offset + available_height]):
-            if y >= h - 1:  # Stop if we run out of space
+        visible_events = events[scroll_offset : scroll_offset + available_height]
+        for offset, event in enumerate(visible_events):
+            if y >= h - 1:
                 break
-                
-            # Calculate the actual event index
-            actual_index = scroll_offset + i
-            
-            # Use different prefix and color for selected event
-            if actual_index == selected_event:
-                prefix = "➤ "
-                title_color = curses.color_pair(5) | curses.A_BOLD
-                desc_color = curses.color_pair(6)
-                marker = "🔘"
-            else:
-                prefix = "  "
-                title_color = curses.color_pair(7) | curses.A_BOLD
-                desc_color = curses.color_pair(6) | curses.A_DIM
-                marker = "○"
-            
-            title = ev.get("title", "")
-            description = ev.get("description", "")
-            
-            # Wrap title to fit in available width
-            title_lines = wrap_text(title, col_events - 5)  # Account for marker and prefix
-            
-            # Display title (first line with prefix and marker, subsequent lines indented)
+
+            actual_index = scroll_offset + offset
+            is_selected = actual_index == selected_event
+
+            prefix = "➤ " if is_selected else "  "
+            marker = "🔘" if is_selected else "○"
+            title_color = (
+                curses.color_pair(5) | curses.A_BOLD
+                if is_selected
+                else curses.color_pair(7) | curses.A_BOLD
+            )
+            desc_color = (
+                curses.color_pair(6)
+                if is_selected
+                else curses.color_pair(6) | curses.A_DIM
+            )
+
+            title_lines = wrap_text(event.get("_title", ""), col_events - 5)
+            if not title_lines:
+                title_lines = ("(untitled)",)
+
             for line_num, title_line in enumerate(title_lines):
                 if y >= h - 1:
                     break
                 if line_num == 0:
-                    # First line: marker + prefix + title
-                    display_text = f"{marker} {prefix}{title_line}"
-                    stdscr.addstr(y, 0, display_text, title_color)
+                    draw_text(stdscr, y, 0, f"{marker} {prefix}{title_line}", title_color)
                 else:
-                    # Subsequent lines: indented
-                    indent = "    "  # Match marker + prefix width
-                    stdscr.addstr(y, 0, indent + title_line, title_color)
+                    draw_text(stdscr, y, 0, f"    {title_line}", title_color)
                 y += 1
-            
-            # Display description only if show_descriptions is True
-            if show_descriptions and description and y < h - 1:
-                desc_lines = wrap_text("✎ " + description, col_events - 3)
+
+            if show_descriptions:
+                desc_lines = wrap_text(f"✎ {event.get('_description', '')}", col_events - 3)
                 for desc_line in desc_lines:
                     if y >= h - 1:
                         break
-                    stdscr.addstr(y, 2, desc_line, desc_color)  # indented
+                    draw_text(stdscr, y, 2, desc_line, desc_color)
                     y += 1
-            
-            # Add spacing between events with a subtle separator
+
             if y < h - 1:
-                stdscr.addstr(y, 0, "┄" * min(col_events, w - 1), curses.color_pair(4) | curses.A_DIM)
+                draw_text(
+                    stdscr,
+                    y,
+                    0,
+                    "┄" * col_events,
+                    curses.color_pair(4) | curses.A_DIM,
+                )
                 y += 1
+    elif not error_message:
+        draw_text(
+            stdscr,
+            max(2, h // 2),
+            max(0, (w // 2) - 8),
+            "No events found.",
+            curses.color_pair(3) | curses.A_BOLD,
+        )
 
-        # Colonne markets (droite) - avec couleurs
-        vol_flag = "🔘 Vfilter:ON" if volume_filter_enabled else "○ Vfilter:OFF"
-        market_header = f"💰 Markets (probs, V24, End, {vol_flag})"
-        stdscr.addstr(0, col_events, market_header[: col_markets - 1], curses.color_pair(4) | curses.A_BOLD)
-        
-        # Draw separator for markets column
-        market_separator = "─" * min(col_markets, w - col_events - 1)
-        stdscr.addstr(1, col_events, market_separator, curses.color_pair(4))
+    vol_flag = "🔘 Vfilter:ON" if volume_filter_enabled else "○ Vfilter:OFF"
+    market_header = f"💰 Markets (probs, V24, End, {vol_flag})"
+    draw_text(
+        stdscr,
+        0,
+        col_events,
+        market_header[: max(0, col_markets - 1)],
+        curses.color_pair(4) | curses.A_BOLD,
+    )
+    draw_text(stdscr, 1, col_events, "─" * col_markets, curses.color_pair(4))
 
+    visible_markets = ()
+    if events:
+        visible_markets = get_visible_markets(
+            events[selected_event],
+            volume_filter_enabled=volume_filter_enabled,
+            volume_threshold=volume_threshold,
+        )
+
+    selected_market = clamp_index(selected_market, len(visible_markets))
+    for index, market in enumerate(visible_markets[: max(0, h - 2)]):
+        y = 2 + index
+        if y >= h - 1:
+            break
+
+        line = format_market_line(market, col_markets - 3)
+        yes_price = market.get("_yes_price")
+        if yes_price is None:
+            color = curses.color_pair(7)
+        elif yes_price > 0.6:
+            color = curses.color_pair(2)
+        elif yes_price < 0.4:
+            color = curses.color_pair(1)
+        else:
+            color = curses.color_pair(3)
+
+        prefix = "➤ " if index == selected_market else "  "
+        if index == selected_market:
+            color |= curses.A_BOLD | curses.A_UNDERLINE
+
+        draw_text(stdscr, y, col_events, prefix + line, color)
+
+    help_text = " 🔼/🔽 Events  ◀/▶ Markets  🔘 V-filter  📝 Desc  🔄 Refresh  🚪 Quit "
+    ts_text = f" ⏱️  {datetime.fromtimestamp(last_refresh).strftime('%H:%M:%S')} "
+
+    if h > 2:
+        draw_text(stdscr, h - 2, 0, "─" * w, curses.color_pair(4))
+
+    version_text = f" 🏷️  v{VERSION} "
+    left_width = max(0, w - len(ts_text) - len(version_text) - 2)
+    draw_text(stdscr, h - 1, 0, help_text[:left_width], curses.color_pair(4) | curses.A_BOLD)
+    draw_text(
+        stdscr,
+        h - 1,
+        max(0, w - len(ts_text) - len(version_text) - 1),
+        version_text,
+        curses.color_pair(6) | curses.A_BOLD,
+    )
+    draw_text(
+        stdscr,
+        h - 1,
+        max(0, w - len(ts_text) - 1),
+        ts_text,
+        curses.color_pair(2) | curses.A_BOLD,
+    )
+
+    if error_message:
+        error_y = h - 3 if h > 3 else 0
+        error_text = f" ⚠️  ERROR: {error_message[: max(0, w - 12)]} ⚠️ "
+        draw_text(
+            stdscr,
+            error_y,
+            0,
+            error_text,
+            curses.color_pair(1) | curses.A_BOLD | curses.A_BLINK,
+        )
+
+    stdscr.noutrefresh()
+    curses.doupdate()
+    return selected_market
+
+
+def main(stdscr):
+    try:
+        curses.curs_set(0)
+    except curses.error:
+        pass
+
+    stdscr.keypad(True)
+    init_colors()
+
+    events = []
+    error_message = None
+    show_descriptions = False
+    volume_filter_enabled = False
+    volume_threshold = 1000.0
+    selected_event = 0
+    selected_market = 0
+
+    last_refresh = time.time()
+    next_refresh = last_refresh + REFRESH_INTERVAL
+    needs_redraw = True
+    previous_size = stdscr.getmaxyx()
+
+    try:
+        events = load_events()
+        error_message = None
+    except APIError as e:
+        error_message = str(e)
+    finally:
+        last_refresh = time.time()
+        next_refresh = last_refresh + REFRESH_INTERVAL
+
+    while True:
+        h, w = stdscr.getmaxyx()
+        if (h, w) != previous_size:
+            previous_size = (h, w)
+            stdscr.clear()
+            needs_redraw = True
+
+        selected_event = clamp_index(selected_event, len(events))
         if events:
-            ev = events[selected_event]
-            markets = ev.get("markets", [])
-
-            if volume_filter_enabled:
-                markets = [
-                    m
-                    for m in markets
-                    if float(_get_volume24(m) or 0) >= volume_threshold
-                ]
-
-            # Sort markets by YES outcome price in descending order
-            def get_yes_price(market):
-                try:
-                    outcome_prices = market.get("outcomePrices", "[]")
-                    if isinstance(outcome_prices, str):
-                        import json
-                        prices = json.loads(outcome_prices)
-                        if prices and len(prices) > 0:
-                            return float(prices[0])  # First price is for "Yes" outcome
-                    elif isinstance(outcome_prices, list) and outcome_prices:
-                        return float(outcome_prices[0])  # First price is for "Yes" outcome
-                    return 0.0
-                except (ValueError, IndexError, json.JSONDecodeError):
-                    return 0.0
-            
-            markets = sorted(
-                markets,
-                key=get_yes_price,
-                reverse=True
+            visible_markets = get_visible_markets(
+                events[selected_event],
+                volume_filter_enabled=volume_filter_enabled,
+                volume_threshold=volume_threshold,
             )
+            selected_market = clamp_index(selected_market, len(visible_markets))
+        else:
+            selected_market = 0
 
-            for j, m in enumerate(markets[: h - 2]):
-                y = 2 + j  # Start after header and separator
-                if y >= h - 1:
-                    break
-                
-                line = format_market_line(m, col_markets - 4)  # Less width for selection marker
-                
-                # Determine if this is the selected market
-                if j == selected_market:
-                    marker = "➤ "
-                    line = marker + line
-                else:
-                    marker = "  "
-                    line = marker + line
-                
-                # Color code based on yes_price if available
-                yes_price = m.get("yesPrice")
-                if yes_price and isinstance(yes_price, (int, float)):
-                    if yes_price > 0.6:
-                        color = curses.color_pair(2)  # Green for high probability
-                    elif yes_price < 0.4:
-                        color = curses.color_pair(1)  # Red for low probability
-                    else:
-                        color = curses.color_pair(3)  # Yellow for medium probability
-                else:
-                    color = curses.color_pair(7)  # White for unknown
-                
-                # Highlight selected market
-                if j == selected_market:
-                    color |= curses.A_BOLD | curses.A_UNDERLINE
-                
-                stdscr.addstr(y, col_events, line, color)
+        if needs_redraw:
+            selected_market = draw_screen(
+                stdscr,
+                events,
+                selected_event,
+                selected_market,
+                show_descriptions,
+                volume_filter_enabled,
+                volume_threshold,
+                last_refresh,
+                error_message,
+            )
+            needs_redraw = False
 
-        # Barre du bas - avec couleurs et ASCII art
-        help_text = " 🔼/🔽 Events  ◀/▶ Markets  🔘 V-filter  📝 Desc  🔄 Refresh  🚪 Quit "
-        ts = datetime.fromtimestamp(last_refresh).strftime("%H:%M:%S")
-        ts_text = f" ⏱️  {ts} "
-
-        # Draw a separator above the footer
-        if h > 2:
-            footer_separator = "─" * w
-            stdscr.addstr(h - 2, 0, footer_separator, curses.color_pair(4))
-
-        # Display help text and timestamp with colors
-        version_text = f" 🏷️  v{VERSION} "
-        left_width = max(0, w - len(ts_text) - len(version_text) - 2)
-        stdscr.addstr(h - 1, 0, help_text[:left_width], curses.color_pair(4) | curses.A_BOLD)
-        stdscr.addstr(h - 1, max(0, w - len(ts_text) - len(version_text) - 1), version_text, curses.color_pair(6) | curses.A_BOLD)
-        stdscr.addstr(h - 1, max(0, w - len(ts_text) - 1), ts_text[: w - 1], curses.color_pair(2) | curses.A_BOLD)
-        
-        # Error message display with better formatting
-        if error_message:
-            error_y = h - 3 if h > 3 else 0
-            error_text = f" ⚠️  ERROR: {error_message[:w-12]} ⚠️ "
-            stdscr.addstr(error_y, 0, error_text, curses.color_pair(1) | curses.A_BOLD | curses.A_BLINK)
-
-        # Use curses.doupdate() for more efficient screen updates
-        curses.doupdate()
-
+        timeout_ms = max(0, int((next_refresh - time.time()) * 1000))
+        stdscr.timeout(timeout_ms)
         ch = stdscr.getch()
+        now = time.time()
+
+        if ch == curses.ERR:
+            if now >= next_refresh:
+                try:
+                    events = load_events(force_refresh=True)
+                    error_message = None
+                except APIError as e:
+                    error_message = str(e)
+                last_refresh = now
+                next_refresh = now + REFRESH_INTERVAL
+                needs_redraw = True
+            continue
+
+        if ch == curses.KEY_RESIZE:
+            needs_redraw = True
+            continue
+
         if ch == ord("q"):
-            # Clear cache when exiting
             cache.clear()
             break
 
-        elif ch == curses.KEY_UP:
-            # Navigate events up
-            selected_event = max(0, selected_event - 1)
-            # Ensure selected event stays visible
-            if selected_event < scroll_offset:
-                scroll_offset = selected_event
-        elif ch == curses.KEY_DOWN:
-            # Navigate events down
-            selected_event = min(len(events) - 1, selected_event + 1)
-            # Ensure selected event stays visible (scroll if needed)
-            available_height = h - 3
-            if selected_event >= scroll_offset + available_height:
-                scroll_offset = selected_event - available_height + 1
-                # Ensure we don't scroll past the end
-                if len(events) > 0:
-                    max_scroll = len(events) - 1  # Last possible scroll position
-                    scroll_offset = min(scroll_offset, max_scroll)
-        elif ch == curses.KEY_LEFT:
-            # Navigate markets left (previous market)
-            if events and len(events) > 0:
-                markets = events[selected_event].get("markets", [])
-                if volume_filter_enabled:
-                    markets = [
-                        m for m in markets
-                        if float(_get_volume24(m) or 0) >= volume_threshold
-                    ]
-                # Sort markets by YES outcome price in descending order (same as display)
-                def get_yes_price(market):
-                    try:
-                        outcome_prices = market.get("outcomePrices", "[]")
-                        if isinstance(outcome_prices, str):
-                            prices = json.loads(outcome_prices)
-                            if prices and len(prices) > 0:
-                                return float(prices[0])  # First price is for "Yes" outcome
-                        elif isinstance(outcome_prices, list) and outcome_prices:
-                            return float(outcome_prices[0])  # First price is for "Yes" outcome
-                        return 0.0
-                    except (ValueError, IndexError, json.JSONDecodeError):
-                        return 0.0
-                
-                markets = sorted(
-                    markets,
-                    key=get_yes_price,
-                    reverse=True
-                )
-                if markets:
-                    selected_market = max(0, selected_market - 1)
-        elif ch == curses.KEY_RIGHT:
-            # Navigate markets right (next market)
-            if events and len(events) > 0:
-                markets = events[selected_event].get("markets", [])
-                if volume_filter_enabled:
-                    markets = [
-                        m for m in markets
-                        if float(_get_volume24(m) or 0) >= volume_threshold
-                    ]
-                # Sort markets by YES outcome price in descending order (same as display)
-                def get_yes_price(market):
-                    try:
-                        outcome_prices = market.get("outcomePrices", "[]")
-                        if isinstance(outcome_prices, str):
-                            prices = json.loads(outcome_prices)
-                            if prices and len(prices) > 0:
-                                return float(prices[0])  # First price is for "Yes" outcome
-                        elif isinstance(outcome_prices, list) and outcome_prices:
-                            return float(outcome_prices[0])  # First price is for "Yes" outcome
-                        return 0.0
-                    except (ValueError, IndexError, json.JSONDecodeError):
-                        return 0.0
-                
-                markets = sorted(
-                    markets,
-                    key=get_yes_price,
-                    reverse=True
-                )
-                if markets:
-                    selected_market = min(len(markets) - 1, selected_market + 1)
-        elif ch == ord("r"):
+        if ch == curses.KEY_UP:
+            new_selected_event = clamp_index(selected_event - 1, len(events))
+            if new_selected_event != selected_event:
+                selected_event = new_selected_event
+                selected_market = 0
+                needs_redraw = True
+            continue
+
+        if ch == curses.KEY_DOWN:
+            new_selected_event = clamp_index(selected_event + 1, len(events))
+            if new_selected_event != selected_event:
+                selected_event = new_selected_event
+                selected_market = 0
+                needs_redraw = True
+            continue
+
+        if ch == curses.KEY_LEFT and events:
+            visible_markets = get_visible_markets(
+                events[selected_event],
+                volume_filter_enabled=volume_filter_enabled,
+                volume_threshold=volume_threshold,
+            )
+            new_selected_market = clamp_index(selected_market - 1, len(visible_markets))
+            if new_selected_market != selected_market:
+                selected_market = new_selected_market
+                needs_redraw = True
+            continue
+
+        if ch == curses.KEY_RIGHT and events:
+            visible_markets = get_visible_markets(
+                events[selected_event],
+                volume_filter_enabled=volume_filter_enabled,
+                volume_threshold=volume_threshold,
+            )
+            new_selected_market = clamp_index(selected_market + 1, len(visible_markets))
+            if new_selected_market != selected_market:
+                selected_market = new_selected_market
+                needs_redraw = True
+            continue
+
+        if ch == ord("r"):
             try:
-                # refresh all events with filters
-                events = fetch_events(
-                    limit=100,
-                    volume_min=1000000,
-                    liquidity_min=10000
-                )
-                selected_event = min(selected_event, max(0, len(events) - 1))
-                last_refresh = time.time()
+                events = load_events(force_refresh=True)
                 error_message = None
             except APIError as e:
                 error_message = str(e)
-                last_refresh = time.time()
-        elif ch == ord("v"):
+            last_refresh = time.time()
+            next_refresh = last_refresh + REFRESH_INTERVAL
+            needs_redraw = True
+            continue
+
+        if ch == ord("v"):
             volume_filter_enabled = not volume_filter_enabled
-        elif ch == ord("d"):
-            # Toggle description display
+            selected_market = 0
+            needs_redraw = True
+            continue
+
+        if ch == ord("d"):
             show_descriptions = not show_descriptions
+            needs_redraw = True
 
 
 def text_mode_main():
@@ -613,46 +681,39 @@ def text_mode_main():
     print("📊 Polymarket Client (Text Mode)")
     print(f"🏷️  Version {VERSION}")
     print("=" * 50)
-    
+
     try:
-        events = fetch_events(
-            limit=1000,  # Increased from 10 to 1000
-            volume_min=1000000,
-            liquidity_min=10000
-        )
-        
+        events = load_events()
         if not events:
             print("No events found.")
             return
-            
-        for i, event in enumerate(events[:5]):  # Show first 5 events
-            print(f"\n🔘 Event {i+1}:")
-            print(f"Title: {event.get('title', 'N/A')}")
-            print(f"Description: {event.get('description', 'N/A')[:100]}...")
-            
-            markets = event.get('markets', [])
+
+        for index, event in enumerate(events[:5]):
+            print(f"\n🔘 Event {index + 1}:")
+            print(f"Title: {event.get('_title', 'N/A')}")
+            print(f"Description: {event.get('_description', 'N/A')[:100]}...")
+
+            markets = get_visible_markets(event)
             if markets:
                 print(f"Markets ({len(markets)}):")
-                for j, market in enumerate(markets[:3]):  # Show first 3 markets
-                    print(f"  {j+1}. {market.get('question', 'N/A')}")
-                    print(f"     Yes: {market.get('yesPrice', 'N/A')} | No: {market.get('noPrice', 'N/A')}")
-                    print(f"     Volume: {market.get('volume24', {}).get('amount', 'N/A')}")
-            
-            if i < 4:  # Don't print separator after last event
+                for market_index, market in enumerate(markets[:3]):
+                    print(f"  {market_index + 1}. {market.get('_question', 'N/A')}")
+                    print(
+                        f"     Yes: {market.get('_yes_pct', 'n/a')} | No: {market.get('_no_pct', 'n/a')}"
+                    )
+                    print(f"     Volume 24h: {market.get('_vol24_str', '0')}")
+
+            if index < 4:
                 print("-" * 50)
-                
     except APIError as e:
         print(f"Error fetching data: {e}")
     except Exception as e:
         print(f"Unexpected error: {e}")
 
+
 if __name__ == "__main__":
-    import os
-    # Check if terminal supports curses
-    if os.environ.get('TERM') == 'dumb' or not os.isatty(0):
+    if os.environ.get("TERM") == "dumb" or not os.isatty(0):
         print("Terminal does not support curses, using text mode...")
-        # Fallback to text mode
         text_mode_main()
     else:
         curses.wrapper(main)
-
