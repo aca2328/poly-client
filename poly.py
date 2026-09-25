@@ -7,7 +7,9 @@ from functools import lru_cache
 
 import requests
 
-BASE = "https://gamma-api.polymarket.com"
+API_HOST = "gamma-api.polymarket.com"
+API_IP = "104.18.34.205"
+BASE = f"https://{API_IP}"
 VERSION = "0.9"
 DEFAULT_EVENT_LIMIT = 1000
 DEFAULT_VOLUME_MIN = 1_000_000
@@ -15,7 +17,19 @@ DEFAULT_LIQUIDITY_MIN = 10_000
 REFRESH_INTERVAL = 10
 REQUEST_TIMEOUT = 10
 
+class StaticAPIAdapter(requests.adapters.HTTPAdapter):
+    """Connect to the static IP while authenticating the official API hostname."""
+
+    def init_poolmanager(self, connections, maxsize, block=False, **pool_kwargs):
+        pool_kwargs.update(server_hostname=API_HOST, assert_hostname=API_HOST)
+        super().init_poolmanager(connections, maxsize, block=block, **pool_kwargs)
+
+
 session = requests.Session()
+# Environment proxies could resolve the hostname themselves or require DNS.
+session.trust_env = False
+session.headers["Host"] = API_HOST
+session.mount(f"{BASE}/", StaticAPIAdapter())
 
 
 def init_colors():
@@ -90,7 +104,11 @@ def fetch_events(
         if liquidity_min:
             params["liquidityMin"] = liquidity_min
 
-        response = session.get(f"{BASE}/events", params=params, timeout=REQUEST_TIMEOUT)
+        response = session.get(
+            f"{BASE}/events", params=params, timeout=REQUEST_TIMEOUT, allow_redirects=False
+        )
+        if response.is_redirect:
+            raise APIError("Events endpoint redirected; update the static API endpoint.")
         response.raise_for_status()
         data = response.json()
         cache.set(cache_key, data)
@@ -106,7 +124,11 @@ def fetch_tags(limit=50, force_refresh=False):
         return cached
 
     try:
-        response = session.get(f"{BASE}/tags", timeout=REQUEST_TIMEOUT)
+        response = session.get(
+            f"{BASE}/tags", timeout=REQUEST_TIMEOUT, allow_redirects=False
+        )
+        if response.is_redirect:
+            raise APIError("Tags endpoint redirected; update the static API endpoint.")
         response.raise_for_status()
         tags = response.json()
 

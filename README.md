@@ -47,6 +47,8 @@ If terminal doesn't support curses, automatically falls back to text mode showin
 ## Technical Details
 
 - **API Endpoint**: `https://gamma-api.polymarket.com`
+- **Static connection**: Connects directly to `104.18.34.205`, preserving the official hostname for TLS/SNI, certificate verification, and the HTTP `Host` header. No hostname DNS lookup is needed. Environment proxies are ignored and redirects are rejected to keep requests on the pinned endpoint.
+- **IP maintenance**: This is a Cloudflare edge address and may change. Update `API_IP` in `poly.py` if it stops working; `172.64.153.51` was also verified during initial testing.
 - **Cache TTL**: 60 seconds
 - **Default Limits**: 1000 events, significant events only
 - **Market Sorting**: By `outcomePrices[0]` (YES outcome) descending
