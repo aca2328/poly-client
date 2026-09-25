@@ -40,6 +40,13 @@ python3 poly.py
 - **v**: Toggle volume filter (1000 USDC minimum)
 - **d**: Toggle event descriptions (show/hide)
 - **q**: Quit application
+- **Enter**: Open details for the selected market
+- **↑/↓**, **Page Up/Page Down**, **Home/End** (in details): Scroll market details
+- **Esc** (in details): Return to the event list
+
+The detail popup adapts to the terminal size and wraps long titles and URLs.
+On narrow terminals, labels appear above values. Very small terminals show a
+resize prompt; Esc and q still work.
 
 ### Text Mode
 If terminal doesn't support curses, automatically falls back to text mode showing first 5 events with 3 markets each.

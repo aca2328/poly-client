@@ -1,6 +1,7 @@
 import curses
 import json
 import os
+import textwrap
 import time
 from datetime import datetime
 from functools import lru_cache
@@ -170,6 +171,13 @@ def _parse_outcome_prices(value):
     return tuple(_coerce_float(price, None) for price in value)
 
 
+def _first_present(mapping, *keys):
+    for key in keys:
+        if key in mapping and mapping.get(key) not in (None, ""):
+            return mapping.get(key)
+    return None
+
+
 def _get_volume24(market):
     return (
         market.get("volume24hr")
@@ -211,6 +219,68 @@ def _format_end_date(market):
         return str(raw)[:10]
 
 
+def _format_compact_number(value):
+    number = _coerce_float(value, None)
+    if number is None:
+        return "n/a"
+
+    abs_number = abs(number)
+    if abs_number >= 1_000_000_000:
+        return f"{number / 1_000_000_000:.1f}B"
+    if abs_number >= 1_000_000:
+        return f"{number / 1_000_000:.1f}M"
+    if abs_number >= 1_000:
+        return f"{number / 1_000:.1f}K"
+    if number.is_integer():
+        return f"{number:.0f}"
+    return f"{number:.2f}"
+
+
+def _format_probability(value):
+    number = _coerce_float(value, None)
+    if number is None:
+        return "n/a"
+    if -1 <= number <= 1:
+        return f"{number * 100:.1f}%"
+    return f"{number:.3f}"
+
+
+def _format_usd_price(value):
+    number = _coerce_float(value, None)
+    if number is None:
+        return "n/a"
+    if abs(number) < 1:
+        return f"${number:.3f}"
+    return f"${number:.2f}"
+
+
+def _format_probability_change(value):
+    number = _coerce_float(value, None)
+    if number is None:
+        return "n/a"
+    if -1 <= number <= 1:
+        return f"{number * 100:+.1f} pts"
+    return f"{number:+.1f}"
+
+
+def _derive_market_status(event, market):
+    if market.get("closed") is True or event.get("closed") is True:
+        return "Closed"
+    if market.get("active") is False or event.get("active") is False:
+        return "Inactive"
+    if market.get("acceptingOrders") is False:
+        return "No orders"
+    return "Active"
+
+
+def _pick_price_with_source(candidates):
+    for label, value in candidates:
+        number = _coerce_float(value, None)
+        if number is not None:
+            return number, label
+    return None, None
+
+
 def _prepare_market(market):
     if market.get("_prepared"):
         return market
@@ -225,6 +295,73 @@ def _prepare_market(market):
         no_price = outcome_prices[1]
 
     vol24 = _coerce_float(_get_volume24(market), 0.0)
+    liquidity = _coerce_float(
+        _first_present(market, "liquidityClob", "clobLiquidity", "liquidity", "liquidityNum"),
+        None,
+    )
+    best_bid = _coerce_float(
+        _first_present(market, "bestBid", "bestBidPrice", "bid", "bidPrice"),
+        None,
+    )
+    best_ask = _coerce_float(
+        _first_present(market, "bestAsk", "bestAskPrice", "ask", "askPrice"),
+        None,
+    )
+    last_trade = _coerce_float(
+        _first_present(
+            market,
+            "lastTradePrice",
+            "lastPrice",
+            "lastTradedPrice",
+            "lastTradedPriceYes",
+        ),
+        None,
+    )
+    mid_price = _coerce_float(
+        _first_present(
+            market,
+            "midPrice",
+            "midpoint",
+            "markPrice",
+            "marketPrice",
+            "currentPrice",
+            "price",
+            "priceNum",
+        ),
+        None,
+    )
+    day_move = _coerce_float(
+        _first_present(
+            market,
+            "oneDayPriceChange",
+            "priceChange24hr",
+            "priceChange24h",
+            "oneDayPriceChangePercent",
+        ),
+        None,
+    )
+    spread = None
+    if best_bid is not None and best_ask is not None and best_ask >= best_bid:
+        spread = best_ask - best_bid
+    if mid_price is None and spread is not None:
+        mid_price = (best_bid + best_ask) / 2
+
+    buy_yes_price, buy_yes_source = _pick_price_with_source(
+        (
+            ("ask", best_ask),
+            ("mark", mid_price),
+            ("yes", yes_price),
+            ("last", last_trade),
+        )
+    )
+    sell_yes_price, sell_yes_source = _pick_price_with_source(
+        (
+            ("bid", best_bid),
+            ("mark", mid_price),
+            ("yes", yes_price),
+            ("last", last_trade),
+        )
+    )
 
     market["_question"] = str(market.get("question", ""))
     market["_yes_price"] = yes_price
@@ -234,7 +371,33 @@ def _prepare_market(market):
     market["_yes_sort_key"] = yes_price if yes_price is not None else -1.0
     market["_vol24"] = vol24
     market["_vol24_str"] = f"{vol24:.0f}"
+    market["_vol24_compact_str"] = _format_compact_number(vol24)
     market["_end_str"] = _format_end_date(market)
+    market["_liquidity"] = liquidity
+    market["_liquidity_str"] = _format_compact_number(liquidity)
+    market["_best_bid"] = best_bid
+    market["_best_bid_str"] = _format_probability(best_bid)
+    market["_best_ask"] = best_ask
+    market["_best_ask_str"] = _format_probability(best_ask)
+    market["_mid_price"] = mid_price
+    market["_mid_price_str"] = _format_probability(mid_price)
+    market["_last_trade"] = last_trade
+    market["_last_trade_str"] = _format_probability(last_trade)
+    market["_day_move"] = day_move
+    market["_day_move_str"] = _format_probability_change(day_move)
+    market["_spread"] = spread
+    market["_spread_str"] = (
+        f"{spread * 100:.1f} pts" if spread is not None and -1 <= spread <= 1 else "n/a"
+    )
+    market["_buy_yes_price"] = buy_yes_price
+    market["_buy_yes_price_str"] = _format_usd_price(buy_yes_price)
+    market["_buy_yes_source"] = buy_yes_source
+    market["_sell_yes_price"] = sell_yes_price
+    market["_sell_yes_price_str"] = _format_usd_price(sell_yes_price)
+    market["_sell_yes_source"] = sell_yes_source
+    market["_resolution_source"] = str(
+        _first_present(market, "resolutionSource", "rulesPrimary", "resolutionCriteria") or ""
+    )
     market["_prepared"] = True
     return market
 
@@ -339,6 +502,58 @@ def format_market_line(market, width):
     return (base + " " + extra)[:width]
 
 
+def format_market_detail_pairs(event, market):
+    pairs = [
+        ("Event", event.get("_title", "")),
+        ("Market", market.get("_question", "")),
+        ("YES / NO", f"{market.get('_yes_pct', 'n/a')} / {market.get('_no_pct', 'n/a')}"),
+    ]
+
+    if market.get("_buy_yes_price") is not None:
+        source = market.get("_buy_yes_source", "n/a")
+        pairs.append(("Buy 1 YES", f"{market.get('_buy_yes_price_str', 'n/a')} ({source})"))
+
+    if market.get("_sell_yes_price") is not None:
+        source = market.get("_sell_yes_source", "n/a")
+        pairs.append(("Sell 1 YES", f"{market.get('_sell_yes_price_str', 'n/a')} ({source})"))
+
+    if market.get("_mid_price") is not None:
+        pairs.append(("Mid / Mark", market.get("_mid_price_str", "n/a")))
+
+    if market.get("_best_bid") is not None or market.get("_best_ask") is not None:
+        pairs.append(
+            (
+                "Best Bid / Ask",
+                f"{market.get('_best_bid_str', 'n/a')} / {market.get('_best_ask_str', 'n/a')}",
+            )
+        )
+
+    if market.get("_spread") is not None:
+        pairs.append(("Spread", market.get("_spread_str", "n/a")))
+
+    if market.get("_last_trade") is not None:
+        pairs.append(("Last Trade", market.get("_last_trade_str", "n/a")))
+
+    pairs.append(("24h Vol", market.get("_vol24_compact_str", "n/a")))
+
+    if market.get("_liquidity") is not None:
+        pairs.append(("Liquidity", market.get("_liquidity_str", "n/a")))
+
+    if market.get("_day_move") is not None:
+        pairs.append(("24h Move", market.get("_day_move_str", "n/a")))
+
+    if market.get("_end_str"):
+        pairs.append(("End", market.get("_end_str", "")))
+
+    pairs.append(("Status", _derive_market_status(event, market)))
+
+    resolution_source = market.get("_resolution_source") or str(event.get("resolutionSource") or "")
+    if resolution_source:
+        pairs.append(("Resolution", resolution_source))
+
+    return tuple(pairs)
+
+
 def draw_text(stdscr, y, x, text, attr=0):
     if not text:
         return
@@ -358,6 +573,28 @@ def draw_text(stdscr, y, x, text, attr=0):
         stdscr.addnstr(y, x, text, max_chars, attr)
     except curses.error:
         pass
+
+
+def layout_detail_rows(pairs, width):
+    """Wrap every field into scrollable rows, including long URLs and titles."""
+    label_width = max((len(label) + 2 for label, _ in pairs), default=0)
+    stacked = width - label_width < 20
+    rows = []
+    for label, value in pairs:
+        if stacked:
+            rows.extend((line, "", 0) for line in textwrap.wrap(f"{label}:", width))
+            value_width = width
+        else:
+            value_width = width - label_width
+        lines = textwrap.wrap(str(value), value_width) or [""]
+        for index, line in enumerate(lines):
+            rows.append((
+                f"{label}:" if not stacked and index == 0 else "",
+                line,
+                0 if stacked else label_width,
+            ))
+    return rows
+
 
 
 def draw_screen(
@@ -508,7 +745,7 @@ def draw_screen(
 
         draw_text(stdscr, y, col_events, prefix + line, color)
 
-    help_text = " 🔼/🔽 Events  ◀/▶ Markets  🔘 V-filter  📝 Desc  🔄 Refresh  🚪 Quit "
+    help_text = " 🔼/🔽 Events  ◀/▶ Markets  ⏎ Details  🔘 V-filter  📝 Desc  🔄 Refresh  🚪 Quit "
     ts_text = f" ⏱️  {datetime.fromtimestamp(last_refresh).strftime('%H:%M:%S')} "
 
     if h > 2:
@@ -548,6 +785,53 @@ def draw_screen(
     return selected_market
 
 
+def draw_market_detail_overlay(
+    stdscr, event, market, last_refresh, error_message, scroll_offset=0
+):
+    h, w = stdscr.getmaxyx()
+    if h < 8 or w < 24:
+        draw_text(stdscr, 0, 0, "Resize for details")
+        stdscr.noutrefresh()
+        curses.doupdate()
+        return scroll_offset, 1, 0
+
+    popup_height = h - 2
+    popup_width = w - 2
+    popup = curses.newwin(popup_height, popup_width, 1, 1)
+    popup.bkgd(" ", curses.color_pair(7))
+    popup.erase()
+    popup.box()
+
+    draw_text(popup, 0, 2, " Details ", curses.color_pair(4) | curses.A_BOLD)
+    ts_text = datetime.fromtimestamp(last_refresh).strftime("%H:%M:%S")
+    if popup_width >= 32:
+        draw_text(popup, 0, popup_width - 10, ts_text, curses.color_pair(2))
+
+    pairs = list(format_market_detail_pairs(event, market))
+    if error_message:
+        pairs.append(("Refresh error", error_message))
+    rows = layout_detail_rows(pairs, popup_width - 4)
+    page_size = popup_height - 4
+    max_scroll = max(0, len(rows) - page_size)
+    scroll_offset = min(max(0, scroll_offset), max_scroll)
+    for y, (label, value, value_x) in enumerate(
+        rows[scroll_offset:scroll_offset + page_size], start=1
+    ):
+        draw_text(popup, y, 2, label, curses.color_pair(5) | curses.A_BOLD)
+        draw_text(popup, y, 2 + value_x, value, curses.color_pair(7))
+
+    position = f"{scroll_offset + 1}-{min(scroll_offset + page_size, len(rows))}/{len(rows)}"
+    draw_text(popup, popup_height - 3, 2, position, curses.color_pair(3))
+    footer = "Up/Down PgUp/PgDn Home/End | Esc Back | q Quit"
+    if popup_width < len(footer) + 4:
+        footer = "Up/Dn Esc Back q Quit"
+    draw_text(popup, popup_height - 2, 2, footer[:popup_width - 4], curses.color_pair(4))
+    popup.noutrefresh()
+    curses.doupdate()
+    return scroll_offset, page_size, max_scroll
+
+
+
 def main(stdscr):
     try:
         curses.curs_set(0)
@@ -564,6 +848,10 @@ def main(stdscr):
     volume_threshold = 1000.0
     selected_event = 0
     selected_market = 0
+    detail_view_open = False
+    detail_scroll = 0
+    detail_page_size = 1
+    detail_max_scroll = 0
 
     last_refresh = time.time()
     next_refresh = last_refresh + REFRESH_INTERVAL
@@ -595,7 +883,10 @@ def main(stdscr):
             )
             selected_market = clamp_index(selected_market, len(visible_markets))
         else:
+            visible_markets = ()
             selected_market = 0
+
+        detail_view_open = detail_view_open and bool(events and visible_markets)
 
         if needs_redraw:
             selected_market = draw_screen(
@@ -609,6 +900,15 @@ def main(stdscr):
                 last_refresh,
                 error_message,
             )
+            if detail_view_open and events and visible_markets:
+                detail_scroll, detail_page_size, detail_max_scroll = draw_market_detail_overlay(
+                    stdscr,
+                    events[selected_event],
+                    visible_markets[selected_market],
+                    last_refresh,
+                    error_message,
+                    detail_scroll,
+                )
             needs_redraw = False
 
         timeout_ms = max(0, int((next_refresh - time.time()) * 1000))
@@ -635,6 +935,30 @@ def main(stdscr):
         if ch == ord("q"):
             cache.clear()
             break
+
+        if detail_view_open:
+            if ch == 27:
+                detail_view_open = False
+                needs_redraw = True
+            elif ch in (curses.KEY_UP, curses.KEY_DOWN, curses.KEY_PPAGE,
+                        curses.KEY_NPAGE, curses.KEY_HOME, curses.KEY_END):
+                offsets = {
+                    curses.KEY_UP: detail_scroll - 1,
+                    curses.KEY_DOWN: detail_scroll + 1,
+                    curses.KEY_PPAGE: detail_scroll - detail_page_size,
+                    curses.KEY_NPAGE: detail_scroll + detail_page_size,
+                    curses.KEY_HOME: 0,
+                    curses.KEY_END: detail_max_scroll,
+                }
+                detail_scroll = min(max(0, offsets[ch]), detail_max_scroll)
+                needs_redraw = True
+            continue
+
+        if ch in (curses.KEY_ENTER, 10, 13) and events and visible_markets:
+            detail_view_open = True
+            detail_scroll = 0
+            needs_redraw = True
+            continue
 
         if ch == curses.KEY_UP:
             new_selected_event = clamp_index(selected_event - 1, len(events))
